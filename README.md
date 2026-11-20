@@ -7,6 +7,7 @@ A tiny, **allocation-free** tree menu engine for embedded C (C99).
 - Two files: `menu.h` + `menu.c`, about 2.2 KB of Flash on a Cortex-M3 (`-Os`)
 - The whole tree can be `const` and live in **Flash**: the only RAM used is one `menu_t` (68 bytes with the default depth)
 - Built in: editing int / bool / enum values, hidden and disabled items, Yes/No confirmation, a scrolling view for small displays, an inactivity timeout, jumping to any page, and breadcrumbs
+- Optional **Persian (Farsi) text** for graphic displays, with 8 px and 16 px fonts, Latin text, and example KS0108 / ST7920 drivers (see [Persian text](#persian-text-farsi))
 
 The library handles **navigation and state only**. *How* a page is drawn is up to you, via a handler callback.
 
@@ -225,13 +226,95 @@ While editing, `MENU_KEY_UP` and encoder clockwise increase the value. Enter sav
 - `menu_selected_child()` now takes the `menu_t`.
 - `MENU_TEXT_LEN` and the `MENU_MAX_CHILDREN` setting are gone.
 
-## Build the demo and tests
+## Persian text (Farsi)
+
+`menu_fa.h` / `menu_fa.c` is an optional module that draws Persian text on any graphic display (KS0108, ST7920, SSD1306, TFT...). It doesn't depend on `menu.c`, so it can also be used on its own. Add it to your build only if you need it, together with the font(s) you use: `menu_fa_font8.c` and/or `menu_fa_font16.c`.
+
+```c
+#include "menu_fa.h"
+
+/* The only display-specific part: set one pixel. */
+static void set_pixel(void *ctx, int x, int y, bool on)
+{
+    (void)ctx;
+    glcd_set_pixel(x, y, on);
+}
+
+/* Titles are plain UTF-8 strings, Persian and Latin mixed freely. */
+MENU_PAGE_DEFINE(pg_wifi, .text = "WiFi تنظیمات", ...);
+
+/* One menu row: right-aligned, clipped, rest of the row filled,
+ * inverted when highlighted. */
+menu_fa_draw_row(&menu_fa_font8, item->page->text, 0, 127, y, item->selected,
+                 set_pixel, NULL);
+
+/* Free-standing text, drawn leftwards from x_right. Returns the x left of it. */
+int x = menu_fa_draw(&menu_fa_font16, "ساعت 12:30", 127, 0, false, set_pixel, NULL);
+int w = menu_fa_width(&menu_fa_font16, "ساعت 12:30");   /* for centring */
+```
+
+What it handles:
+
+- **Letter forms:** picks isolated, initial, medial or final from the neighbouring letters, including letters that never join forward (ا آ د ذ ر ز ژ و), ء, and the half-space (ZWNJ, `U+200C`), as in «می‌شود».
+- **لا ligature:** ل followed by ا (or آ أ إ) is drawn as لا.
+- **Numbers:** ASCII, Persian and Arabic-Indic digits are drawn as Persian digits. A number stays left to right inside right-to-left text, including separators and a trailing percent sign: `12:30`, `3.5`, `1,000`, `1404/05/01`, `50%`.
+- **Latin text:** English words are drawn left to right with a Latin font inside the right-to-left line: `WiFi تنظیمات`, `USB 2.0`, `2.4GHz`. A closing bracket that matches one inside the Latin text stays with it: `WiFi (2.4GHz)`.
+- **Mirroring:** brackets and quotes in right-to-left text are mirrored, so `(...)`, `[...]` and `«...»` open and close on the correct side.
+- **Arabic variants:** ي ى ك ھ ہ are drawn with the matching Persian glyphs; أ إ ؤ ئ ة have their own.
+- **Punctuation:** all ASCII punctuation plus ؟ ، ؛ « » ٫ ٪. Characters no font has (emoji...) are skipped.
+- **Memory:** no buffers and no `malloc`; it walks the string directly. On AVR the fonts go to `PROGMEM` automatically (0 bytes of RAM).
+
+Strings must be **UTF-8**, which is the default in STM32CubeIDE, VS Code and recent Atmel/Microchip Studio. Older projects that store Persian as Windows-1256 need their source files re-saved as UTF-8.
+
+### Fonts
+
+| Font | Height | Flash (Cortex-M3) | Source |
+|---|---|---|---|
+| `menu_fa_font8` | 8 px | ~2.0 KB | 8×8 Persian and 5×7 Latin bitmap glyphs |
+| `menu_fa_font16` | 16 px | ~4.1 KB | Rendered from DejaVu Sans (Bitstream Vera licence; see the notice in the file) |
+
+The engine (`menu_fa.c`) is about 1.7 KB. Only the fonts you reference are linked in.
+
+Fonts are kept as editable ASCII art in [`tools/font8.txt`](tools/font8.txt) and [`tools/font16.txt`](tools/font16.txt). To change a glyph, edit the art and run `make fonts` (needs Python 3). [`tools/gen_fa_fonts.py`](tools/gen_fa_fonts.py) can also render a new font from any TrueType file that has the Arabic presentation forms:
+
+```sh
+python tools/gen_fa_fonts.py render MyFont.ttf 16 > tools/my_font.txt
+python tools/gen_fa_fonts.py build tools/my_font.txt my_font > menu_fa_my_font.c
+```
+
+If you draw with your own routine, `menu_fa_shape()` returns the glyph slots in drawing order, and `menu_fa_glyph_column()` / `menu_fa_glyph_width()` give the bitmaps.
+
+## Display drivers (examples)
+
+[`examples/drivers/`](examples/drivers) has small portable drivers for the two most common 128×64 graphic LCDs:
+
+| Driver | Interface | Notes |
+|---|---|---|
+| [`glcd_ks0108`](examples/drivers/glcd_ks0108.h) | 8-bit parallel, CS1/CS2 | R/W tied to GND; only changed 64-byte blocks are sent |
+| [`glcd_st7920`](examples/drivers/glcd_st7920.h) | Serial (SPI), PSB = GND | 3 wires; only changed rows are sent |
+
+Each keeps a 1 KB framebuffer and talks to the hardware through a few functions you provide (pins, SPI, microsecond delay), so they work on any MCU. Their `set_pixel` functions plug straight into `menu_fa`:
+
+```c
+static glcd_ks0108_t lcd;
+glcd_ks0108_init(&lcd, &my_hal);   /* see the header for an STM32 HAL example */
+
+menu_fa_draw_row(&menu_fa_font8, "تنظیمات", 0, 127, 0, true, glcd_ks0108_set_pixel, &lcd);
+glcd_ks0108_flush(&lcd);
+```
+
+The drivers are tested on the PC against a simulated controller (`tests/test_drivers.c`), which checks every command and data byte they send. They have not been tried on real hardware yet, so please report any timing issues.
+
+## Build the demos and tests
 
 The demo in [`examples/demo.c`](examples/demo.c) runs on a PC and draws a const menu tree with `printf`, as if on a 4-line display. It shows every feature. To use it on a board, swap `draw()` for your display code and the `getchar()` loop for your buttons.
+
+[`examples/demo_fa.c`](examples/demo_fa.c) draws a Persian menu into a simulated 128×64 graphic LCD and prints it as ASCII art. Run `./demo_fa 16` for the 16-pixel font.
 
 ```sh
 make
 ./demo      # w/s = up/down, e = enter, b = back, h = home, g = goto, t = +10 s, q = quit
+./demo_fa   # Persian menu on a simulated 128x64 LCD (same keys); ./demo_fa 16 for the big font
 make test   # host-side unit tests
 ```
 
