@@ -3,21 +3,24 @@
 A tiny, **allocation-free** tree menu engine for embedded C (C99).
 
 - No `malloc`, no recursion, no platform dependencies
-- Works with any display (LCD, OLED, UART terminal) and any input (buttons, encoder, keyboard)
-- Two files: `menu.h` + `menu.c`
-- Compile-time configuration via macros
+- Works with any display (LCD, OLED, UART terminal) and any input (buttons, rotary encoder, keyboard)
+- Two files: `menu.h` + `menu.c`, about 2.2 KB of Flash on a Cortex-M3 (`-Os`)
+- The whole tree can be `const` and live in **Flash**: the only RAM used is one `menu_t` (68 bytes with the default depth)
+- Built in: editing int / bool / enum values, hidden and disabled items, Yes/No confirmation, a scrolling view for small displays, an inactivity timeout, jumping to any page, and breadcrumbs
+- Optional **Persian (Farsi) text** for graphic displays, with 8 px and 16 px fonts, Latin text, and example KS0108 / ST7920 drivers (see [Persian text](#persian-text-farsi))
 
 The library handles **navigation and state only**. *How* a page is drawn is up to you, via a handler callback.
 
 ## Concept
 
-The menu is a tree of pages. Each page has a title, an optional parent, up to `MENU_MAX_CHILDREN` children, a highlighted child, and an optional handler.
+The menu is a tree of pages. Each page has a title, any number of children (up to 255), and an optional handler.
 
 ```
 Main
 ├── Settings
-│   ├── Toggle LED   (handler: on_led)
-│   └── Baudrate     (handler: on_baud)
+│   ├── LED            (bool value)
+│   ├── Brightness     (int value 0..100)
+│   └── Factory reset  (asks Yes/No)
 └── About
 ```
 
@@ -25,100 +28,303 @@ The same tree as a diagram (rendered automatically by GitHub):
 
 ```mermaid
 graph TD
-    A["Main<br/><small>root, parent = NULL</small>"] --> B["Settings<br/><small>handler: draw</small>"]
-    A --> C["About<br/><small>handler: NULL</small>"]
-    B --> D["Toggle LED<br/><small>handler: on_led</small>"]
-    B --> E["Baudrate<br/><small>handler: on_baud</small>"]
+    A["Main<br/><small>root</small>"] --> B["Settings<br/><small>handler: on_page</small>"]
+    A --> C["About<br/><small>leaf: action</small>"]
+    B --> D["LED<br/><small>leaf: bool value</small>"]
+    B --> E["Brightness<br/><small>leaf: int value</small>"]
+    B --> F["Factory reset<br/><small>leaf: confirm + action</small>"]
     classDef page fill:#EEEDFE,stroke:#534AB7,color:#26215C;
     classDef leaf fill:#E1F5EE,stroke:#0F6E56,color:#04342C;
     class A,B page;
-    class C,D,E leaf;
+    class C,D,E,F leaf;
 ```
 
-Purple = page with children (entering it makes it the current page). Teal = leaf (entering it runs its handler).
+Purple = page with children (entering it makes it the current page). Teal = leaf (entering it runs an action, edits a value, or asks for confirmation).
 
-A `menu_t` controller tracks the *current* page. Your input code calls `menu_next / menu_prev / menu_enter / menu_back`.
-
-**Handler rules**
-
-| Situation | What happens |
-|---|---|
-| `menu_enter()` on a child that has children | it becomes the current page, then its handler is called |
-| `menu_enter()` on a leaf | its handler is called (use it as an "action") |
-| `menu_back()` | the parent becomes current, then its handler is called (so it can redraw) |
+Pages hold only constant data. All runtime state (the current path, what's highlighted on each level, what's being edited, the timeout counter) lives in one `menu_t`. Your input code calls `menu_input()` (or `menu_next / prev / enter / back`), and the library tells your handlers when to draw.
 
 ## Quick start
 
 ```c
 #include "menu.h"
 
-static menu_t menu;
-static menu_page_t root, settings, led;
+static bool    led_on;
+static int32_t brightness = 50;
 
-static void draw(menu_page_t *page)  { /* draw page->text and its children */ }
-static void toggle_led(menu_page_t *self) { /* do something */ }
+static const menu_value_t led_value        = MENU_VALUE_BOOL_INIT(&led_on);
+static const menu_value_t brightness_value = MENU_VALUE_INT_INIT(&brightness, 0, 100, 10);
+
+static void on_page(menu_t *menu, const menu_page_t *self, menu_event_t event)
+{
+    (void)self; (void)event;
+    draw(menu);                               /* your display code, see below */
+}
+
+static void on_reset(menu_t *menu, const menu_page_t *self, menu_event_t event)
+{
+    (void)menu; (void)self;
+    if (event == MENU_EVT_ACTION) factory_reset();
+}
+
+/* Declare every page first so they can point at each other... */
+MENU_PAGE_DECLARE(pg_main);
+MENU_PAGE_DECLARE(pg_led);
+MENU_PAGE_DECLARE(pg_brightness);
+MENU_PAGE_DECLARE(pg_reset);
+
+/* ...then define them. Everything here is const: it stays in Flash. */
+MENU_PAGE_DEFINE(pg_main,       .text = "Main", .handler = on_page,
+                                .first_child = &pg_led);
+MENU_PAGE_DEFINE(pg_led,        .text = "LED", .value = &led_value,
+                                .next_sibling = &pg_brightness);
+MENU_PAGE_DEFINE(pg_brightness, .text = "Brightness", .value = &brightness_value,
+                                .next_sibling = &pg_reset);
+MENU_PAGE_DEFINE(pg_reset,      .text = "Factory reset", .handler = on_reset,
+                                .flags = MENU_FLAG_CONFIRM);
+
+static menu_t menu;
 
 void app_init(void)
 {
-    menu_page_init(&root,     0, "Main",       draw);
-    menu_page_init(&settings, 1, "Settings",   draw);
-    menu_page_init(&led,      2, "Toggle LED", toggle_led);
-
-    menu_add_child(&root, &settings);
-    menu_add_child(&settings, &led);
-
-    menu_init(&menu, &root);
-    draw(menu_current(&menu));
+    menu_init(&menu, &pg_main);               /* draws Main */
+    menu_set_timeout(&menu, 30000);           /* back to Main after 30 s idle */
 }
 
-/* Call from your button / encoder code */
-void on_up(void)    { menu_prev(&menu);  draw(menu_current(&menu)); }
-void on_down(void)  { menu_next(&menu);  draw(menu_current(&menu)); }
-void on_ok(void)    { menu_enter(&menu); }
-void on_back(void)  { menu_back(&menu);  }
+/* Buttons: no drawing needed here. */
+void on_button(menu_key_t key) { menu_input(&menu, key); }
+
+/* Rotary encoder: */
+void on_encoder(int8_t steps)  { menu_scroll(&menu, steps); }
+
+/* SysTick or main loop: */
+void every_10ms(void)          { menu_tick(&menu, 10); }
 ```
 
-Drawing a page is just iterating its children:
+### Drawing
+
+`menu_view()` gives you the rows to draw on a display with `ROWS` lines, already scrolled so the highlight is visible and with hidden items left out:
 
 ```c
-for (uint8_t i = 0; i < page->child_count; i++) {
-    bool hl = (i == page->selected);
-    lcd_print(page->children[i]->text, hl);
+void draw(menu_t *menu)
+{
+    menu_item_t items[ROWS];
+    uint8_t n = menu_view(menu, items, ROWS);
+
+    if (menu_mode(menu) == MENU_MODE_CONFIRM) {
+        lcd_printf("%s?  %s", menu_active(menu)->text,
+                   menu_confirm_yes(menu) ? "[Yes] No" : "Yes [No]");
+        return;
+    }
+    for (uint8_t i = 0; i < n; i++) {
+        const menu_page_t *p = items[i].page;
+        lcd_print_row(i, p->text, items[i].selected, items[i].disabled);
+        if (p->value != NULL) {
+            const char *label = menu_value_label(menu, p);   /* enum text, or NULL */
+            int32_t v = menu_value_get(menu, p);            /* shows the edit in progress */
+            lcd_print_value(i, label, v, items[i].editing);
+        }
+    }
 }
 ```
+
+For a breadcrumb title (`Main > Settings`), loop `menu_path(menu, 0 .. menu_depth(menu))`.
+
+You can also build the tree at runtime instead, for example when menu items depend on what hardware is present:
+
+```c
+static menu_page_t root, led;
+menu_page_init(&root, 0, "Main", on_page);
+menu_page_init(&led,  1, "LED",  NULL);
+led.value = &led_value;
+menu_add_child(&root, &led);
+```
+
+## Events
+
+A handler is `void handler(menu_t *menu, const menu_page_t *self, menu_event_t event)`.
+
+| Call | Events sent |
+|---|---|
+| `menu_init()`, `menu_home()` | `ENTER` → root |
+| `menu_next()` / `menu_prev()` | `SELECT` → current page (`REFRESH` while editing or confirming) |
+| `menu_enter()` on a page with children | it becomes current, `ENTER` → that page |
+| `menu_enter()` on a plain leaf | `ACTION` → leaf, then `REFRESH` → current page |
+| `menu_enter()` on a bool value | the bool is toggled, `VALUE_CHANGED` → leaf, `REFRESH` → current page |
+| `menu_enter()` on an int / enum value | edit mode starts, `REFRESH` → current page |
+| `menu_enter()` while editing | the value is saved, `VALUE_CHANGED` → leaf (only if it changed), `REFRESH` |
+| `menu_enter()` on a `MENU_FLAG_CONFIRM` leaf | confirm mode starts (answer defaults to No), `REFRESH` |
+| `menu_enter()` while confirming | on Yes: `ACTION` → leaf. Then `REFRESH` |
+| `menu_back()` | parent becomes current, `BACK` → parent. While editing / confirming: cancels, `REFRESH` |
+| `menu_goto(page)` | `ENTER` → the page (or to its parent, with it highlighted, if it's a leaf) |
+| `menu_refresh()` | `REFRESH` → current page |
+| `menu_tick()` reaches the timeout | edit / confirm cancelled, back to root, `TIMEOUT` → root |
+
+`ENTER`, `BACK`, `SELECT`, `REFRESH` and `TIMEOUT` all mean "draw yourself", so a page handler can usually ignore the event. A leaf handler only needs `ACTION` or `VALUE_CHANGED` (for example, to save to EEPROM). The library writes the variable itself.
+
+## Features
+
+**Values.** Point `.value` at a `menu_value_t`:
+
+| Macro | Variable | Behaviour |
+|---|---|---|
+| `MENU_VALUE_INT_INIT(&v, min, max, step)` | `int32_t` | Edit mode, clamped to min..max |
+| `MENU_VALUE_BOOL_INIT(&v)` | `bool` | Toggles straight away on Enter |
+| `MENU_VALUE_ENUM_INIT(&v, options)` | `uint8_t` index | Edit mode, wraps through `options[]` (a real array) |
+
+While editing, `MENU_KEY_UP` and encoder clockwise increase the value. Enter saves it, Back cancels.
+
+**Hidden / disabled items.** Set `.state` to a function that returns `MENU_ITEM_NORMAL`, `MENU_ITEM_DISABLED` (drawn, but can't be highlighted) or `MENU_ITEM_HIDDEN` (not drawn). It's checked whenever the menu moves or is drawn, so items can appear when the hardware they need is detected.
+
+**Confirmation.** `.flags = MENU_FLAG_CONFIRM` on an action leaf asks Yes/No before `ACTION` is sent.
+
+**Shared handlers.** `.user` is a free pointer, so one handler can serve several pages (for example, `.user = &beep_ms`).
+
+**Input.** `menu_input(menu, MENU_KEY_UP / DOWN / ENTER / BACK / HOME)` for buttons, `menu_scroll(menu, delta)` for a rotary encoder (one redraw per call, however many steps).
+
+**Timeout.** `menu_set_timeout(menu, ms)` and call `menu_tick(menu, elapsed_ms)` regularly. Every key resets the timer. The timeout fires once and stays quiet until the next key.
+
+**Jumping.** `menu_goto(menu, page)` finds the page anywhere in the tree (no parent pointers needed) and rebuilds the path, so Back works as if the user had walked there. `menu_home()` returns to root.
 
 ## API
 
 | Function | Description |
 |---|---|
-| `menu_page_init(page, id, text, handler)` | Initialize a page (zeroes all fields, safe-copies the title) |
-| `menu_add_child(parent, child)` | Attach a child; returns `MENU_ERR_FULL` if the parent is full |
-| `menu_init(menu, root)` | Start the controller at `root` |
-| `menu_next / menu_prev(menu)` | Move highlight (wraps around) |
-| `menu_enter(menu)` | Activate the highlighted child |
-| `menu_back(menu)` | Go to the parent page |
-| `menu_current(menu)` | Get the current page |
-| `menu_selected_child(page)` | Get the highlighted child (or `NULL`) |
+| `menu_page_init(page, id, text, handler)` | Initialize a runtime page (zeroes all fields). `text` is stored as a pointer |
+| `menu_add_child(parent, child)` | Append a runtime child. Errors: `HAS_PARENT`, `LOOP`, `FULL` (255) |
+| `menu_init(menu, root)` | Start at `root` and send it `ENTER` |
+| `menu_next / menu_prev(menu)` | Move highlight (wraps, skips hidden/disabled), or change the value being edited |
+| `menu_enter(menu)` | Open / run / edit / toggle / confirm, or accept |
+| `menu_back(menu)` | Go to the parent, or cancel |
+| `menu_home(menu)` | Go to root |
+| `menu_goto(menu, page)` | Jump to a page. Errors: `NOT_FOUND`, `DEPTH` |
+| `menu_input(menu, key)` | Button helper |
+| `menu_scroll(menu, delta)` | Encoder helper |
+| `menu_refresh(menu)` | Ask the current page to redraw |
+| `menu_set_timeout(menu, ms)` / `menu_tick(menu, ms)` | Inactivity timeout |
+| `menu_view(menu, items, rows)` | Rows to draw, scrolled |
+| `menu_value_get(menu, page)` / `menu_value_label(menu, page)` | Value to show / enum text |
+| `menu_current`, `menu_selected_child`, `menu_selected_index` | Where we are |
+| `menu_depth`, `menu_path(menu, level)` | Breadcrumbs |
+| `menu_mode`, `menu_active`, `menu_confirm_yes` | Edit / confirm state |
+| `menu_child_count`, `menu_child_at`, `menu_item_state` | Tree helpers |
 
 ## Configuration
 
-Override at compile time (`-DMENU_MAX_CHILDREN=8`) or before including the header:
-
 | Macro | Default | Meaning |
 |---|---|---|
-| `MENU_MAX_CHILDREN` | 5 | Max children per page |
-| `MENU_TEXT_LEN` | 20 | Title buffer size (including `'\0'`) |
+| `MENU_MAX_DEPTH` | 8 | Max tree levels, root included. Each level costs 6 bytes of RAM in `menu_t` |
 
-Each page costs roughly `MENU_TEXT_LEN + MENU_MAX_CHILDREN * sizeof(void*) + ~12` bytes of RAM.
+`MENU_MAX_DEPTH` changes the size of `menu_t`, so **`menu.c` and all your files must see the same value**. Set it either as a compiler flag for the whole project (`-DMENU_MAX_DEPTH=10`), or in a `menu_config.h` on your include path and build with `-DMENU_USE_CONFIG_FILE`. Don't `#define` it in a single `.c` file before including `menu.h`.
 
-## Build the demo
+## Migrating from the first version
+
+- Handlers are now `void h(menu_t *menu, const menu_page_t *self, menu_event_t event)`.
+- `menu_init()` draws the root and `menu_next/prev()` send `SELECT`, so remove manual `draw()` calls after them.
+- The highlight moved from `page->selected` into `menu_t`: use `menu_selected_index(menu)` or `menu_view()`.
+- `page->children[i]` and `page->child_count` are gone: walk `first_child` / `next_sibling`, or use `menu_child_at()` / `menu_child_count()`.
+- `page->text` is a `const char *`: pass strings that live as long as the page.
+- `menu_selected_child()` now takes the `menu_t`.
+- `MENU_TEXT_LEN` and the `MENU_MAX_CHILDREN` setting are gone.
+
+## Persian text (Farsi)
+
+`menu_fa.h` / `menu_fa.c` is an optional module that draws Persian text on any graphic display (KS0108, ST7920, SSD1306, TFT...). It doesn't depend on `menu.c`, so it can also be used on its own. Add it to your build only if you need it, together with the font(s) you use: `menu_fa_font8.c` and/or `menu_fa_font16.c`.
+
+```c
+#include "menu_fa.h"
+
+/* The only display-specific part: set one pixel. */
+static void set_pixel(void *ctx, int x, int y, bool on)
+{
+    (void)ctx;
+    glcd_set_pixel(x, y, on);
+}
+
+/* Titles are plain UTF-8 strings, Persian and Latin mixed freely. */
+MENU_PAGE_DEFINE(pg_wifi, .text = "WiFi تنظیمات", ...);
+
+/* One menu row: right-aligned, clipped, rest of the row filled,
+ * inverted when highlighted. */
+menu_fa_draw_row(&menu_fa_font8, item->page->text, 0, 127, y, item->selected,
+                 set_pixel, NULL);
+
+/* Free-standing text, drawn leftwards from x_right. Returns the x left of it. */
+int x = menu_fa_draw(&menu_fa_font16, "ساعت 12:30", 127, 0, false, set_pixel, NULL);
+int w = menu_fa_width(&menu_fa_font16, "ساعت 12:30");   /* for centring */
+```
+
+What it handles:
+
+- **Letter forms:** picks isolated, initial, medial or final from the neighbouring letters, including letters that never join forward (ا آ د ذ ر ز ژ و), ء, and the half-space (ZWNJ, `U+200C`), as in «می‌شود».
+- **لا ligature:** ل followed by ا (or آ أ إ) is drawn as لا.
+- **Numbers:** ASCII, Persian and Arabic-Indic digits are drawn as Persian digits. A number stays left to right inside right-to-left text, including separators and a trailing percent sign: `12:30`, `3.5`, `1,000`, `1404/05/01`, `50%`.
+- **Latin text:** English words are drawn left to right with a Latin font inside the right-to-left line: `WiFi تنظیمات`, `USB 2.0`, `2.4GHz`. A closing bracket that matches one inside the Latin text stays with it: `WiFi (2.4GHz)`.
+- **Mirroring:** brackets and quotes in right-to-left text are mirrored, so `(...)`, `[...]` and `«...»` open and close on the correct side.
+- **Arabic variants:** ي ى ك ھ ہ are drawn with the matching Persian glyphs; أ إ ؤ ئ ة have their own.
+- **Punctuation:** all ASCII punctuation plus ؟ ، ؛ « » ٫ ٪. Characters no font has (emoji...) are skipped.
+- **Memory:** no buffers and no `malloc`; it walks the string directly. On AVR the fonts go to `PROGMEM` automatically (0 bytes of RAM).
+
+Strings must be **UTF-8**, which is the default in STM32CubeIDE, VS Code and recent Atmel/Microchip Studio. Older projects that store Persian as Windows-1256 need their source files re-saved as UTF-8.
+
+### Fonts
+
+| Font | Height | Flash (Cortex-M3) | Source |
+|---|---|---|---|
+| `menu_fa_font8` | 8 px | ~2.0 KB | 8×8 Persian and 5×7 Latin bitmap glyphs |
+| `menu_fa_font16` | 16 px | ~4.1 KB | Rendered from DejaVu Sans (Bitstream Vera licence; see the notice in the file) |
+
+The engine (`menu_fa.c`) is about 1.7 KB. Only the fonts you reference are linked in.
+
+Fonts are kept as editable ASCII art in [`tools/font8.txt`](tools/font8.txt) and [`tools/font16.txt`](tools/font16.txt). To change a glyph, edit the art and run `make fonts` (needs Python 3). [`tools/gen_fa_fonts.py`](tools/gen_fa_fonts.py) can also render a new font from any TrueType file that has the Arabic presentation forms:
+
+```sh
+python tools/gen_fa_fonts.py render MyFont.ttf 16 > tools/my_font.txt
+python tools/gen_fa_fonts.py build tools/my_font.txt my_font > menu_fa_my_font.c
+```
+
+If you draw with your own routine, `menu_fa_shape()` returns the glyph slots in drawing order, and `menu_fa_glyph_column()` / `menu_fa_glyph_width()` give the bitmaps.
+
+## Display drivers (examples)
+
+[`examples/drivers/`](examples/drivers) has small portable drivers for the two most common 128×64 graphic LCDs:
+
+| Driver | Interface | Notes |
+|---|---|---|
+| [`glcd_ks0108`](examples/drivers/glcd_ks0108.h) | 8-bit parallel, CS1/CS2 | R/W tied to GND; only changed 64-byte blocks are sent |
+| [`glcd_st7920`](examples/drivers/glcd_st7920.h) | Serial (SPI), PSB = GND | 3 wires; only changed rows are sent |
+
+Each keeps a 1 KB framebuffer and talks to the hardware through a few functions you provide (pins, SPI, microsecond delay), so they work on any MCU. Their `set_pixel` functions plug straight into `menu_fa`:
+
+```c
+static glcd_ks0108_t lcd;
+glcd_ks0108_init(&lcd, &my_hal);   /* see the header for an STM32 HAL example */
+
+menu_fa_draw_row(&menu_fa_font8, "تنظیمات", 0, 127, 0, true, glcd_ks0108_set_pixel, &lcd);
+glcd_ks0108_flush(&lcd);
+```
+
+The drivers are tested on the PC against a simulated controller (`tests/test_drivers.c`), which checks every command and data byte they send. They have not been tried on real hardware yet, so please report any timing issues.
+
+## Build the demos and tests
+
+The demo in [`examples/demo.c`](examples/demo.c) runs on a PC and draws a const menu tree with `printf`, as if on a 4-line display. It shows every feature. To use it on a board, swap `draw()` for your display code and the `getchar()` loop for your buttons.
+
+[`examples/demo_fa.c`](examples/demo_fa.c) draws a Persian menu into a simulated 128×64 graphic LCD and prints it as ASCII art. Run `./demo_fa 16` for the 16-pixel font.
 
 ```sh
 make
-./demo      # w = up, s = down, e = enter, b = back, q = quit
+./demo      # w/s = up/down, e = enter, b = back, h = home, g = goto, t = +10 s, q = quit
+./demo_fa   # Persian menu on a simulated 128x64 LCD (same keys); ./demo_fa 16 for the big font
+make test   # host-side unit tests
 ```
 
 ## Notes
 
-- Pages must outlive the menu (use `static` or globals, not stack variables of a returning function).
+- Pages, title strings and value variables must outlive the menu (use `static` or globals).
+- Don't pass pages of a `const` tree to `menu_add_child()`, and don't mix runtime and `const` pages under one parent.
 - Not thread/ISR safe: call the API from one context only (e.g. the main loop). If buttons are read in an ISR, set a flag there and call the menu from the main loop.
+- Child lists are walked linearly. With menu-sized lists (a handful of items) this doesn't matter.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
