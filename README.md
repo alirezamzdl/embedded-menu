@@ -122,7 +122,3 @@ make
 
 - Pages must outlive the menu (use `static` or globals, not stack variables of a returning function).
 - Not thread/ISR safe: call the API from one context only (e.g. the main loop). If buttons are read in an ISR, set a flag there and call the menu from the main loop.
-
-## License
-
-MIT (add a `LICENSE` file before publishing).
